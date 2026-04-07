@@ -149,9 +149,10 @@ def _convert_simple(samples: np.ndarray, sr: int, duty: int = 2) -> np.ndarray:
     events = []
     prev_reg = -1
 
+    n_samples = len(samples)
     for i, (freq, vol) in enumerate(zip(f0, rms_norm)):
         offset = int(times[i] * sr)
-        if offset >= n_samples := len(samples):
+        if offset >= n_samples:
             break
 
         # ピッチをGBレジスタ値に丸めることで「階段状ピッチ」を再現
