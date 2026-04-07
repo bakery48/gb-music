@@ -1,22 +1,38 @@
 """
 CH4: ノイズチャンネル
 
-LFSR (Linear Feedback Shift Register) ベースのホワイト/ピンクノイズ。
+LFSR (Linear Feedback Shift Register) ベースのノイズ。
 
-GBの実際のLFSRパラメータ:
-    - クロック分周比 (r): 0〜7
-    - シフトクロックフリケンシー (s): 0〜13
-    - カウンタステップ幅 (width): 15bit or 7bit
-    周波数: f = 524288 / max(r, 0.5) / 2^(s+1)
+GBの正確なLFSRアルゴリズム:
+    1. ビット0とビット1をXOR
+    2. レジスタ全体を1bit右シフト
+    3. XOR結果をビット14（最上位）に代入
+    4. 7bitモード時はさらにビット6にも代入
+
+周波数式:
+    clock_divider = r == 0 ? 4 : r * 8
+    period_cycles = clock_divider * 2^(s+1)
+    freq = 4194304 / period_cycles
+         = 524288 / max(r, 0.5) / 2^s  (近似)
+
+    ※ s=14,15はLFSRクロック停止（無音）
 """
 
 import numpy as np
 
 
 def noise_frequency(r: int, s: int) -> float:
-    """LFSRのパラメータから等価周波数[Hz]を計算する。"""
-    divisor = max(r, 0.5)
-    return 524288.0 / divisor / (2 ** (s + 1))
+    """
+    LFSRパラメータから等価周波数[Hz]を計算する。
+
+    r: クロック分周比 (0〜7)
+    s: シフト量 (0〜13 が有効, 14/15は無音)
+    """
+    if s >= 14:
+        return 0.0
+    clock_divider = 4 if r == 0 else r * 8
+    period_cycles = clock_divider * (2 ** (s + 1))
+    return 4194304.0 / period_cycles
 
 
 class NoiseChannel:
@@ -25,8 +41,8 @@ class NoiseChannel:
 
     events: list of (sample_offset, r, s, width7, volume)
         r: 0〜7 クロック分周比
-        s: 0〜13 シフトクロック
-        width7: True=7bit LFSR (高音域ノイズ), False=15bit LFSR (ホワイトノイズ)
+        s: 0〜13 シフトクロック (14/15は無音)
+        width7: True=7bit LFSR (周期短い・音程感あるノイズ), False=15bit LFSR (ホワイトノイズ)
         volume: 0.0〜1.0
     """
 
@@ -50,8 +66,11 @@ class NoiseChannel:
                 break
             end = min(end, n_samples)
 
-            n = end - offset
             freq = noise_frequency(r, s)
+            if freq <= 0:
+                continue
+
+            n = end - offset
             noise = _generate_lfsr_noise(n, freq, width7, self.sample_rate)
             output[offset:end] += noise * volume
 
@@ -65,44 +84,47 @@ class NoiseChannel:
         onset_strength: 0.0〜1.0
         Returns: (r, s, width7)
         """
-        # 強いオンセット → シャープなノイズ (高周波, 7bit LFSR)
-        # 弱いオンセット → ソフトなノイズ (低周波, 15bit LFSR)
         if onset_strength > 0.7:
-            return 0, 2, True    # スネア/ハイハット系
+            return 0, 2, True    # ハイハット/スネア: 高周波・7bit（短周期ノイズ）
         elif onset_strength > 0.4:
-            return 1, 4, False   # 中間
+            return 1, 4, False   # スネア: 中周波・15bit
         else:
-            return 4, 7, False   # バスドラム系
+            return 4, 6, False   # バスドラム: 低周波・15bit
 
 
 def _generate_lfsr_noise(
     n_samples: int, freq_hz: float, width7: bool, sample_rate: int
 ) -> np.ndarray:
-    """LFSR疑似ノイズを生成する。"""
-    if freq_hz <= 0:
-        return np.zeros(n_samples, dtype=np.float32)
+    """
+    GB仕様に準拠したLFSR疑似ノイズを生成する。
 
-    # LFSRのクロック周期（サンプル単位）
+    アルゴリズム:
+        XOR = bit0 XOR bit1
+        LFSR >>= 1
+        LFSR |= XOR << 14
+        if width7: LFSR |= XOR << 6  (bit6にも代入)
+        出力 = bit0の反転（0=HIGH, 1=LOW → GB DAC反転で0→+1）
+    """
     clock_period = max(1, round(sample_rate / freq_hz))
 
-    # 簡略化したLFSR実装
-    if width7:
-        mask = 0x7F
-        tap = 0x60      # bit6 XOR bit5
-    else:
-        mask = 0x7FFF
-        tap = 0x6000    # bit14 XOR bit13
-
-    lfsr = 0x7FFF
+    lfsr = 0x7FFF  # 初期値（全ビット1）
     output = np.zeros(n_samples, dtype=np.float32)
     clock = 0
 
     for i in range(n_samples):
         if clock == 0:
-            feedback = bin(lfsr & tap).count("1") % 2
-            lfsr = ((lfsr >> 1) | (feedback << (6 if width7 else 14))) & mask
+            # bit0 XOR bit1
+            xor = (lfsr ^ (lfsr >> 1)) & 1
+            # 右シフトしてbit14に挿入
+            lfsr = (lfsr >> 1) | (xor << 14)
+            if width7:
+                # 7bitモード: bit6にも挿入、下位7bitのみ有効
+                lfsr = (lfsr & ~(1 << 6)) | (xor << 6)
+                lfsr &= 0x7FFF  # 15bitマスク（bit14まで保持）
             clock = clock_period
-        output[i] = 1.0 if (lfsr & 1) else -1.0
+
+        # bit0が0→+1 (LOW=HIGH per GB DAC inversion)、bit0が1→-1
+        output[i] = 1.0 if (lfsr & 1) == 0 else -1.0
         clock -= 1
 
     return output

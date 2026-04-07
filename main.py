@@ -7,7 +7,7 @@ gb-music: MP3をゲームボーイ音源に変換するCLIツール
     python main.py input.mp3 -o output.wav --mode full --duty 2
 """
 
-import sys
+import os
 import click
 import numpy as np
 
@@ -21,7 +21,7 @@ from gb_converter.exporter import export_wav
 @click.option(
     "-o", "--output", "output_path",
     default=None,
-    help="出力ファイルパス (.wav または .mp3)。未指定時は input_gb.wav",
+    help="出力ファイルパス (.wav または .mp3)。未指定時は <input>_gb.wav",
 )
 @click.option(
     "--mode",
@@ -29,8 +29,8 @@ from gb_converter.exporter import export_wav
     default="simple",
     show_default=True,
     help=(
-        "simple: ビットクラッシャー方式（高速）/ "
-        "full: チャンネル合成方式（高品質）"
+        "simple: ピッチ追跡→矩形波合成（高速・推奨）/ "
+        "full: 4チャンネル合成方式（低速・高品質）"
     ),
 )
 @click.option(
@@ -41,13 +41,13 @@ from gb_converter.exporter import export_wav
     help="矩形波のデューティ比 (0=12.5%%, 1=25%%, 2=50%%, 3=75%%)",
 )
 @click.option(
-    "--ch1-gain", default=0.25, show_default=True, help="CH1 ゲイン (0.0〜1.0)"
+    "--ch1-gain", default=0.30, show_default=True, help="CH1 ゲイン (0.0〜1.0)"
 )
 @click.option(
     "--ch2-gain", default=0.25, show_default=True, help="CH2 ゲイン (0.0〜1.0)"
 )
 @click.option(
-    "--ch3-gain", default=0.30, show_default=True, help="CH3 ゲイン (0.0〜1.0)"
+    "--ch3-gain", default=0.25, show_default=True, help="CH3 ゲイン (0.0〜1.0)"
 )
 @click.option(
     "--ch4-gain", default=0.20, show_default=True, help="CH4 ゲイン (0.0〜1.0)"
@@ -70,7 +70,6 @@ def main(
     """MP3ファイルをゲームボーイ音源に変換する。"""
 
     if output_path is None:
-        import os
         base = os.path.splitext(os.path.basename(input_path))[0]
         output_path = f"{base}_gb.wav"
 
@@ -91,7 +90,7 @@ def main(
     }
 
     if mode == "simple":
-        output = _convert_simple(samples, sr)
+        output = _convert_simple(samples, sr, duty)
     else:
         output = _convert_full(samples, sr, n_samples, duty, gains)
 
@@ -114,33 +113,59 @@ def main(
     click.echo("完了!")
 
 
-def _convert_simple(samples: np.ndarray, sr: int) -> np.ndarray:
+def _convert_simple(samples: np.ndarray, sr: int, duty: int = 2) -> np.ndarray:
     """
-    Phase 1: ビットクラッシャー方式
+    シンプルモード: ピッチ追跡 → GB矩形波再合成
 
-    4bit量子化 + ダウンサンプリングによるGB風エフェクト。
+    1. librosa.yin でフレームごとのピッチを高速検出
+    2. RMS でボリュームエンベロープを取得
+    3. GBのレジスタ値に周波数をスナップ（特徴的な階段状ピッチ）
+    4. CH1矩形波として合成 + 4bit量子化
     """
-    from gb_converter.apu.channel1 import quantize_4bit
+    import librosa
+    from gb_converter.apu.channel1 import (
+        PulseChannel, quantize_4bit, hz_to_register, register_to_hz
+    )
 
-    click.echo("ビットクラッシャー変換中...")
+    hop_length = 512
 
-    # 4bit量子化
-    quantized = quantize_4bit(samples)
+    click.echo("ピッチ追跡中 (YIN)...")
+    f0 = librosa.yin(
+        samples,
+        fmin=65.0,   # C2
+        fmax=2093.0, # C7
+        sr=sr,
+        hop_length=hop_length,
+    )
 
-    # GBのサンプリングレート相当 (約8192Hz) でダウンサンプリング → アップサンプリング
-    gb_sr = 8192
-    factor = sr // gb_sr
-    if factor > 1:
-        # ダウンサンプリング（間引き）
-        downsampled = quantized[::factor]
-        # アップサンプリング（最近傍補間）
-        upsampled = np.repeat(downsampled, factor)
-        # 長さを元に合わせる
-        if len(upsampled) < len(samples):
-            upsampled = np.pad(upsampled, (0, len(samples) - len(upsampled)))
-        quantized = upsampled[: len(samples)]
+    click.echo("ボリュームエンベロープ取得中...")
+    rms = librosa.feature.rms(y=samples, hop_length=hop_length)[0]
+    rms_norm = rms / (rms.max() + 1e-8)
 
-    return quantized.astype(np.float32)
+    times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
+
+    # GBレジスタ値にスナップしてイベント生成
+    # 同じレジスタ値が続く場合はイベントをまとめる（無駄な重複排除）
+    events = []
+    prev_reg = -1
+
+    for i, (freq, vol) in enumerate(zip(f0, rms_norm)):
+        offset = int(times[i] * sr)
+        if offset >= n_samples := len(samples):
+            break
+
+        # ピッチをGBレジスタ値に丸めることで「階段状ピッチ」を再現
+        reg = hz_to_register(float(freq))
+        gb_freq = register_to_hz(reg)
+        volume = float(np.clip(vol * 1.2, 0.0, 1.0))
+
+        if reg != prev_reg:
+            events.append((offset, gb_freq, duty, volume))
+            prev_reg = reg
+
+    click.echo("矩形波合成中...")
+    output = PulseChannel(sr).render(events, len(samples))
+    return output
 
 
 def _convert_full(
@@ -151,47 +176,52 @@ def _convert_full(
     gains: dict[str, float],
 ) -> np.ndarray:
     """
-    Phase 2: チャンネル合成方式
+    フルモード: 4チャンネル合成
 
-    ピッチ/オンセット検出 → 各チャンネル合成 → ミックス。
+    CH1: メインメロディ（高音域ピッチ） → 矩形波
+    CH2: ハーモニー（5度下）          → 矩形波
+    CH3: ベースライン（低音域）        → カスタム波形
+    CH4: 打楽器（オンセット検出）      → LFSRノイズ
     """
+    import librosa
     from gb_converter.analyzer import (
         detect_pitches,
         detect_onsets,
-        split_melody_lines,
         pitch_events,
         onset_events,
     )
     from gb_converter.apu import PulseChannel, PulseChannel2, WaveChannel, NoiseChannel
+    from gb_converter.apu.channel1 import hz_to_register, register_to_hz
 
-    click.echo("ピッチ検出中 (時間がかかる場合があります)...")
+    click.echo("ピッチ検出中 (pYIN)...")
     times, freqs, magnitudes = detect_pitches(samples, sr)
 
     click.echo("オンセット検出中...")
     onset_times, onset_strengths = detect_onsets(samples, sr)
 
-    click.echo("メロディラインを分割中...")
-    lines = split_melody_lines(times, freqs, magnitudes, n_channels=2)
-
-    # CH1: 高音域メロディ
-    click.echo("CH1 (矩形波) 合成中...")
-    ch1_events = pitch_events(*lines[0], sr=sr, duty=duty)
+    # CH1: メインメロディ
+    click.echo("CH1 (矩形波 メロディ) 合成中...")
+    ch1_events = pitch_events(times, freqs, magnitudes, sr=sr, duty=duty)
     ch1 = PulseChannel(sr).render(ch1_events, n_samples)
 
-    # CH2: 低音域メロディ
-    click.echo("CH2 (矩形波) 合成中...")
-    ch2_events = pitch_events(*lines[1], sr=sr, duty=duty)
+    # CH2: メロディの完全5度下（GB音楽でよく使われるハーモニー）
+    click.echo("CH2 (矩形波 ハーモニー) 合成中...")
+    fifth_down_ratio = 2 / 3  # 完全5度下 = 周波数を2/3倍
+    ch2_events = [
+        (off, max(freq * fifth_down_ratio, 65.0), duty, vol * 0.7)
+        for off, freq, duty_, vol in ch1_events
+        if freq > 0
+    ]
     ch2 = PulseChannel2(sr).render(ch2_events, n_samples)
 
-    # CH3: 低音域をカスタム波形で再生
-    click.echo("CH3 (波形) 合成中...")
-    bands = split_bands(samples, sr)
+    # CH3: 低音域のベースライン（波形チャンネル）
+    click.echo("CH3 (波形 ベース) 合成中...")
     wave_ram = WaveChannel.sine_wave_ram()
-    ch3_events = _make_wave_events(bands["low"], sr, wave_ram)
+    ch3_events = _make_bass_events(times, freqs, magnitudes, sr, wave_ram)
     ch3 = WaveChannel(sr).render(ch3_events, n_samples)
 
-    # CH4: ノイズ（打楽器）
-    click.echo("CH4 (ノイズ) 合成中...")
+    # CH4: 打楽器ノイズ
+    click.echo("CH4 (ノイズ 打楽器) 合成中...")
     ch4_events = onset_events(onset_times, onset_strengths, sr)
     ch4 = NoiseChannel(sr).render(ch4_events, n_samples)
 
@@ -199,29 +229,41 @@ def _convert_full(
     return mix(ch1, ch2, ch3, ch4, gains)
 
 
-def _make_wave_events(
-    low_band: np.ndarray,
+def _make_bass_events(
+    times: np.ndarray,
+    freqs: np.ndarray,
+    magnitudes: np.ndarray,
     sr: int,
     wave_ram: np.ndarray,
-    segment_sec: float = 0.1,
 ) -> list[tuple[int, float, np.ndarray, float]]:
     """
-    低音域のエンベロープからCH3イベントを生成する。
+    メロディピッチの2オクターブ下をCH3ベースとして生成する。
 
-    低音域のRMSをボリュームとして、固定周波数でWave RAMを再生する。
+    有音フレームのみ発音、無音区間はスキップ。
     """
-    seg_len = int(sr * segment_sec)
-    events = []
-    n = len(low_band)
+    from gb_converter.apu.channel3 import hz_to_register_wave
 
-    for i in range(0, n, seg_len):
-        seg = low_band[i: i + seg_len]
-        rms = float(np.sqrt(np.mean(seg ** 2)))
-        if rms > 0.01:
-            # 低音域を代表する周波数 (固定: ベース音A2=110Hz付近)
-            freq = 110.0
-            volume = float(np.clip(rms * 4.0, 0.0, 1.0))
-            events.append((i, freq, wave_ram, volume))
+    events = []
+    prev_reg = -1
+
+    for t, freq, mag in zip(times, freqs, magnitudes):
+        offset = int(t * sr)
+        if freq <= 0:
+            if prev_reg != -1:
+                events.append((offset, 0.0, wave_ram, 0.0))
+                prev_reg = -1
+            continue
+
+        # 2オクターブ下
+        bass_freq = freq / 4.0
+        bass_freq = max(bass_freq, 65.0)  # CH3の最低周波数付近
+
+        reg = hz_to_register_wave(bass_freq)
+        volume = float(np.clip(mag * 0.8, 0.0, 1.0))
+
+        if reg != prev_reg:
+            events.append((offset, bass_freq, wave_ram, volume))
+            prev_reg = reg
 
     return events
 
