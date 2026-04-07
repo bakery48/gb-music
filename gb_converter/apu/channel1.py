@@ -101,9 +101,12 @@ def _pulse_wave(t: np.ndarray, freq_hz: float, duty: float) -> np.ndarray:
 
 
 def quantize_4bit(samples: np.ndarray) -> np.ndarray:
-    """float32[-1,1]を4bit(16レベル)に量子化して再び[-1,1]に戻す。"""
+    """float32[-1,1]を符号付き4bit(−8〜7)に量子化して再び[-1,1]に戻す。
+
+    符号付きにすることで 0.0 → 0.0 のマッピングを保証する。
+    """
     clipped = np.clip(samples, -1.0, 1.0)
-    levels = 16
-    quantized = np.round((clipped + 1.0) / 2.0 * (levels - 1))
-    quantized = np.clip(quantized, 0, levels - 1)
-    return (quantized / (levels - 1) * 2.0 - 1.0).astype(np.float32)
+    # -1..1 → -8..8 にスケール後、-8..7 にクランプ
+    quantized = np.round(clipped * 8.0)
+    quantized = np.clip(quantized, -8.0, 7.0)
+    return (quantized / 8.0).astype(np.float32)
