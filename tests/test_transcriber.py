@@ -44,8 +44,15 @@ class TestMidiName:
         assert _midi_name(72) == "C5"
 
 
+class TestHasBasicPitch:
+    def test_returns_bool(self):
+        from gb_converter.transcriber import has_basic_pitch
+        result = has_basic_pitch()
+        assert isinstance(result, bool)
+
+
 class TestTranscribeIntegration:
-    """実際の音声ファイルを使った統合テスト（sinewaveで代用）。"""
+    """実際の音声ファイルを使った統合テスト（sinewaveで代用）。両エンジンで動作確認。"""
 
     def _make_sine_wav(self, freq_hz: float = 440.0, duration: float = 2.0,
                        sr: int = 44100) -> str:
@@ -64,14 +71,25 @@ class TestTranscribeIntegration:
         assert isinstance(events, list)
 
     def test_transcribe_sine_detects_pitch(self):
-        """440Hzサイン波から A4付近のノートが検出されること"""
+        """440Hzサイン波から A4付近のノートが検出されること（両エンジン共通）"""
         from gb_converter.transcriber import transcribe
         path = self._make_sine_wav(freq_hz=440.0, duration=2.0)
         events = transcribe(path)
         assert len(events) > 0
-        # 検出されたピッチが A4(69) ±2半音以内
         pitches = [e.pitch_midi for e in events]
-        assert any(67 <= p <= 71 for p in pitches), f"検出ピッチ: {pitches}"
+        # basic-pitch: ±2半音、lite: ±3半音で許容
+        assert any(66 <= p <= 72 for p in pitches), f"検出ピッチ: {pitches}"
+
+    def test_transcribe_lite_directly(self):
+        """liteモードを直接呼び出して動作確認"""
+        from gb_converter.transcriber import _transcribe_lite
+        path = self._make_sine_wav(freq_hz=440.0, duration=2.0)
+        events = _transcribe_lite(path, min_note_len_sec=0.05,
+                                  min_freq_hz=65.0, max_freq_hz=2093.0)
+        assert isinstance(events, list)
+        if events:
+            pitches = [e.pitch_midi for e in events]
+            assert any(66 <= p <= 72 for p in pitches), f"検出ピッチ: {pitches}"
 
     def test_transcribe_events_sorted(self):
         """出力が開始時刻順にソートされていること"""

@@ -104,7 +104,9 @@ def main(
     duration = n_samples / sr
     click.echo(f"      {duration:.1f}秒  SR={sr}Hz")
 
-    click.echo("[2/6] 楽譜化中 (basic-pitch) ...")
+    from gb_converter.transcriber import has_basic_pitch
+    engine = "basic-pitch" if has_basic_pitch() else "lite (librosa YIN)"
+    click.echo(f"[2/6] 楽譜化中 ({engine}) ...")
     notes = transcribe(
         input_path,
         onset_threshold=onset_threshold,
