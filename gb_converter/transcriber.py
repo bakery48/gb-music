@@ -1,17 +1,17 @@
 """
-Step 1: MP3 → ノートイベント変換
+MP3 → ノートイベント変換 (librosa のみ使用)
 
-basic-pitch (Spotify) がインストールされていればそちらを使い、
-なければ librosa の YIN ピッチ追跡にフォールバックする。
+pop-to-8bit (IEEE 2017) の手法に基づく:
+  1. HPSS で調波成分 / 打楽器成分に分離
+  2. 調波成分に pYIN でピッチ追跡（有声/無声の信頼度付き）
+  3. オンセット検出でノート境界を決定
+  4. フレームを NoteEvent に集約
 
-  basic-pitch モード: ポリフォニック対応・高精度
-  lite モード:       モノフォニック・軽量（basic-pitch不要）
+依存ライブラリ: librosa, numpy のみ（TensorFlow 不要）
 """
 
 from __future__ import annotations
 
-import warnings
-import os
 import numpy as np
 from dataclasses import dataclass
 
@@ -19,10 +19,10 @@ from dataclasses import dataclass
 @dataclass
 class NoteEvent:
     """1つの音符を表すイベント。"""
-    pitch_midi: int      # MIDIノート番号 (0〜127)
-    start_sec: float     # 開始時刻 [秒]
-    end_sec: float       # 終了時刻 [秒]
-    velocity: int        # ベロシティ (0〜127)
+    pitch_midi: int    # MIDIノート番号 (0〜127)
+    start_sec: float   # 開始時刻 [秒]
+    end_sec: float     # 終了時刻 [秒]
+    velocity: int      # ベロシティ (0〜127)
 
     @property
     def duration_sec(self) -> float:
@@ -34,176 +34,169 @@ class NoteEvent:
         return 440.0 * (2.0 ** ((self.pitch_midi - 69) / 12.0))
 
 
-def has_basic_pitch() -> bool:
-    """basic-pitch が使用可能かチェックする。"""
-    try:
-        import importlib
-        importlib.import_module("basic_pitch")
-        return True
-    except ImportError:
-        return False
-
-
 def transcribe(
     audio_path: str,
-    onset_threshold: float = 0.5,
-    frame_threshold: float = 0.3,
-    min_note_len_sec: float = 0.05,
+    min_note_len_sec: float = 0.08,
     min_freq_hz: float = 65.0,
     max_freq_hz: float = 2093.0,
+    voiced_threshold: float = 0.35,
+    onset_delta: float = 0.07,
 ) -> list[NoteEvent]:
     """
-    音声ファイルをノートイベントのリストに変換する。
+    音声ファイルを NoteEvent リストに変換する。
 
-    basic-pitch が使える場合はそちらを使い、
-    使えない場合は自動的に lite モードにフォールバックする。
+    Args:
+        audio_path:       入力音声ファイル (.mp3 / .wav など)
+        min_note_len_sec: これより短いノートは除去する [秒]
+        min_freq_hz:      検出下限周波数 [Hz]  (デフォルト: C2)
+        max_freq_hz:      検出上限周波数 [Hz]  (デフォルト: C7)
+        voiced_threshold: 有声判定の確率閾値 (0〜1)
+        onset_delta:      オンセット検出感度（小さいほど多く検出）
+
+    Returns:
+        NoteEvent のリスト（開始時刻順）
     """
-    if has_basic_pitch():
-        return _transcribe_basic_pitch(
-            audio_path, onset_threshold, frame_threshold,
-            min_note_len_sec, min_freq_hz, max_freq_hz,
-        )
-    else:
-        return _transcribe_lite(audio_path, min_note_len_sec, min_freq_hz, max_freq_hz)
+    import librosa
 
+    # 1. 音声ロード
+    samples, sr = librosa.load(audio_path, sr=22050, mono=True)
+    hop = 256
 
-def _transcribe_basic_pitch(
-    audio_path: str,
-    onset_threshold: float,
-    frame_threshold: float,
-    min_note_len_sec: float,
-    min_freq_hz: float,
-    max_freq_hz: float,
-) -> list[NoteEvent]:
-    """basic-pitch によるポリフォニック変換。"""
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    warnings.filterwarnings("ignore")
-    import logging
-    logging.getLogger("root").setLevel(logging.ERROR)
+    # 2. HPSS: 調波成分と打楽器成分を分離
+    #    調波成分 → ピッチ追跡 / 打楽器成分 → オンセット検出に使う
+    harmonic, percussive = librosa.effects.hpss(samples, margin=3.0)
 
-    from basic_pitch.inference import predict, Model
-    from basic_pitch import ICASSP_2022_MODEL_PATH
+    # 3. pYIN: 調波成分から有声/無声フラグ付きでピッチを推定
+    f0, voiced_flag, voiced_prob = librosa.pyin(
+        harmonic,
+        fmin=min_freq_hz,
+        fmax=max_freq_hz,
+        sr=sr,
+        hop_length=hop,
+        fill_na=0.0,
+    )
+    f0 = np.nan_to_num(f0, nan=0.0)
 
-    model = Model(ICASSP_2022_MODEL_PATH)
-    _, _midi, note_events = predict(
-        audio_path,
-        model,
-        onset_threshold=onset_threshold,
-        frame_threshold=frame_threshold,
-        minimum_note_length=min_note_len_sec * 1000,
-        minimum_frequency=min_freq_hz,
-        maximum_frequency=max_freq_hz,
-        multiple_pitch_bends=False,
-        melodia_trick=True,
+    # 信頼度が低いフレームを無音扱いにする
+    f0 = np.where(voiced_prob >= voiced_threshold, f0, 0.0)
+
+    # 4. オンセット検出: 打楽器成分から発音境界を検出
+    onset_env = librosa.onset.onset_strength(
+        y=percussive, sr=sr, hop_length=hop
+    )
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env,
+        sr=sr,
+        hop_length=hop,
+        backtrack=True,
+        delta=onset_delta,
+    )
+    onset_set = set(onset_frames.tolist())
+
+    # 5. フレームごとの RMS → ベロシティ推定
+    rms = librosa.feature.rms(y=harmonic, frame_length=512, hop_length=hop)[0]
+    rms_norm = rms / (rms.max() + 1e-8)
+
+    # 6. フレームをノートイベントに集約
+    events = _frames_to_notes(
+        f0, rms_norm, onset_set,
+        sr=sr, hop=hop,
+        min_note_len_sec=min_note_len_sec,
+        min_freq_hz=min_freq_hz,
+        max_freq_hz=max_freq_hz,
     )
 
-    events = []
-    for start, end, pitch, amplitude, _ in note_events:
-        velocity = int(np.clip(amplitude * 127, 1, 127))
-        events.append(NoteEvent(
-            pitch_midi=int(pitch),
-            start_sec=float(start),
-            end_sec=float(end),
-            velocity=velocity,
-        ))
     events.sort(key=lambda e: (e.start_sec, e.pitch_midi))
     return events
 
 
-def _transcribe_lite(
-    audio_path: str,
+def _frames_to_notes(
+    f0: np.ndarray,
+    rms_norm: np.ndarray,
+    onset_set: set[int],
+    sr: int,
+    hop: int,
     min_note_len_sec: float,
     min_freq_hz: float,
     max_freq_hz: float,
 ) -> list[NoteEvent]:
     """
-    librosa だけで動くライトモードの変換。
+    pYIN のフレーム列をノートイベントに集約する。
 
-    YIN ピッチ追跡 + オンセット検出 でノートの開始・終了を推定する。
-    モノフォニック前提だが basic-pitch 不要で軽量。
+    ノート境界の決定ルール:
+      - オンセット検出フレーム
+      - 無音→有声 / 有声→無音 の切り替わり
+      - ピッチが半音以上変化したとき
     """
-    import librosa
-
-    samples, sr = librosa.load(audio_path, sr=44100, mono=True)
-    hop_length = 512
-
-    # ピッチ検出 (YIN)
-    f0 = librosa.yin(
-        samples,
-        fmin=min_freq_hz,
-        fmax=max_freq_hz,
-        sr=sr,
-        hop_length=hop_length,
-    )
-
-    # オンセット検出（ノートの切れ目として使う）
-    onset_env = librosa.onset.onset_strength(y=samples, sr=sr, hop_length=hop_length)
-    onset_frames = librosa.onset.onset_detect(
-        onset_envelope=onset_env,
-        sr=sr,
-        hop_length=hop_length,
-        backtrack=True,
-        delta=0.1,
-    )
-    onset_set = set(onset_frames.tolist())
-
-    # フレームごとの音量（ベロシティ推定に使用）
-    rms = librosa.feature.rms(y=samples, hop_length=hop_length)[0]
-    rms_norm = rms / (rms.max() + 1e-8)
-
-    # フレームをノートイベントにまとめる
     events: list[NoteEvent] = []
-    seg_start_frame: int | None = None
-    seg_pitch: float = 0.0
-    seg_vel_sum: float = 0.0
-    seg_frames: int = 0
 
-    def _flush(end_frame: int) -> None:
-        nonlocal seg_start_frame, seg_pitch, seg_vel_sum, seg_frames
-        if seg_start_frame is None or seg_frames == 0:
+    # 現在のセグメント
+    seg_start: int | None = None
+    seg_pitches: list[float] = []
+    seg_vels: list[float] = []
+
+    def flush(end_frame: int) -> None:
+        nonlocal seg_start, seg_pitches, seg_vels
+        if seg_start is None or not seg_pitches:
+            seg_start = None
+            seg_pitches = []
+            seg_vels = []
             return
-        dur = (end_frame - seg_start_frame) * hop_length / sr
-        if dur < min_note_len_sec:
-            seg_start_frame = None
-            seg_frames = 0
-            return
-        pitch_midi = int(round(librosa.hz_to_midi(seg_pitch / seg_frames)))
-        pitch_midi = int(np.clip(pitch_midi, 0, 127))
-        velocity   = int(np.clip(seg_vel_sum / seg_frames * 127, 1, 127))
-        start_sec  = seg_start_frame * hop_length / sr
-        end_sec    = end_frame * hop_length / sr
-        events.append(NoteEvent(pitch_midi, start_sec, end_sec, velocity))
-        seg_start_frame = None
-        seg_frames = 0
+
+        dur = (end_frame - seg_start) * hop / sr
+        if dur >= min_note_len_sec:
+            mean_freq = float(np.median(seg_pitches))
+            pitch_midi = int(np.clip(
+                round(librosa.hz_to_midi(mean_freq)), 0, 127
+            ))
+            velocity = int(np.clip(np.mean(seg_vels) * 127, 1, 127))
+            events.append(NoteEvent(
+                pitch_midi=pitch_midi,
+                start_sec=seg_start * hop / sr,
+                end_sec=end_frame * hop / sr,
+                velocity=velocity,
+            ))
+
+        seg_start = None
+        seg_pitches = []
+        seg_vels = []
+
+    import librosa
+    prev_midi: int | None = None
 
     for i, (freq, vol) in enumerate(zip(f0, rms_norm)):
-        is_voiced = freq > 0 and min_freq_hz <= freq <= max_freq_hz
-        is_onset  = i in onset_set
+        is_voiced = float(freq) > 0
 
-        if is_onset and seg_start_frame is not None:
-            _flush(i)
+        # ノート境界: オンセット
+        if i in onset_set and seg_start is not None:
+            flush(i)
 
         if is_voiced:
-            if seg_start_frame is None:
-                seg_start_frame = i
-                seg_pitch = 0.0
-                seg_vel_sum = 0.0
-                seg_frames = 0
-            seg_pitch   += freq
-            seg_vel_sum += float(vol)
-            seg_frames  += 1
+            cur_midi = int(round(librosa.hz_to_midi(float(freq))))
+
+            # ノート境界: 半音以上のピッチジャンプ
+            if (seg_start is not None
+                    and prev_midi is not None
+                    and abs(cur_midi - prev_midi) >= 1):
+                flush(i)
+
+            if seg_start is None:
+                seg_start = i
+
+            seg_pitches.append(float(freq))
+            seg_vels.append(float(vol))
+            prev_midi = cur_midi
         else:
-            if seg_start_frame is not None:
-                _flush(i)
+            if seg_start is not None:
+                flush(i)
+            prev_midi = None
 
-    _flush(len(f0))
-
-    events.sort(key=lambda e: (e.start_sec, e.pitch_midi))
+    flush(len(f0))
     return events
 
 
 def print_summary(events: list[NoteEvent]) -> None:
-    """ノートイベントの統計を表示する（デバッグ用）。"""
+    """ノートイベントの統計を表示する。"""
     if not events:
         print("ノートイベントなし")
         return

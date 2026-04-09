@@ -1,18 +1,17 @@
 """
 gb-music: MP3をゲームボーイ音源に変換するCLIツール
 
-パイプライン:
-  1. 音声ロード          (loader)
-  2. 楽譜化              (transcriber / basic-pitch)
-  3. チャンネル振り分け  (scheduler)
-  4. GBイベント生成      (note_mapper)
-  5. APU合成+ミックス    (synthesizer)
-  6. WAV出力             (exporter)
+パイプライン (pop-to-8bit 方式):
+  1. 音声ロード
+  2. HPSS分離 + pYIN でノートイベント化 (librosaのみ・TF不要)
+  3. チャンネル振り分け (CH1〜CH4)
+  4. GBレジスタ値へのマッピング
+  5. APU合成 + ミックス
+  6. WAV出力
 
 使い方:
   python main.py input.mp3
-  python main.py input.mp3 -o output.wav
-  python main.py input.mp3 --duty 1 --bass-midi 48 --no-ch4
+  python main.py input.mp3 -o output.wav --duty 1 --no-ch4
 """
 
 import os
@@ -36,16 +35,16 @@ from gb_converter.exporter import export_wav
 )
 # --- 変換品質 ---
 @click.option(
-    "--onset-threshold", default=0.5, show_default=True,
-    help="basic-pitch 発音検出の閾値 (0〜1、高いほど厳しい)",
-)
-@click.option(
-    "--frame-threshold", default=0.3, show_default=True,
-    help="basic-pitch フレーム持続の閾値 (0〜1)",
-)
-@click.option(
-    "--min-note-len", default=0.05, show_default=True,
+    "--min-note-len", default=0.08, show_default=True,
     help="これより短いノートは除去する [秒]",
+)
+@click.option(
+    "--voiced-threshold", default=0.35, show_default=True,
+    help="pYIN 有声判定の信頼度閾値 (0〜1、高いほど厳しい)",
+)
+@click.option(
+    "--onset-delta", default=0.07, show_default=True,
+    help="オンセット検出感度 (小さいほど多く検出)",
 )
 # --- チャンネル設定 ---
 @click.option(
@@ -78,9 +77,9 @@ from gb_converter.exporter import export_wav
 def main(
     input_path: str,
     output_path: str | None,
-    onset_threshold: float,
-    frame_threshold: float,
     min_note_len: float,
+    voiced_threshold: float,
+    onset_delta: float,
     duty: int,
     bass_midi: int,
     no_ch4: bool,
@@ -101,17 +100,14 @@ def main(
     samples, sr = load_audio(input_path)
     samples = normalize(samples)
     n_samples = len(samples)
-    duration = n_samples / sr
-    click.echo(f"      {duration:.1f}秒  SR={sr}Hz")
+    click.echo(f"      {n_samples / sr:.1f}秒  SR={sr}Hz")
 
-    from gb_converter.transcriber import has_basic_pitch
-    engine = "basic-pitch" if has_basic_pitch() else "lite (librosa YIN)"
-    click.echo(f"[2/6] 楽譜化中 ({engine}) ...")
+    click.echo("[2/6] 楽譜化中 (HPSS + pYIN) ...")
     notes = transcribe(
         input_path,
-        onset_threshold=onset_threshold,
-        frame_threshold=frame_threshold,
         min_note_len_sec=min_note_len,
+        voiced_threshold=voiced_threshold,
+        onset_delta=onset_delta,
     )
     if verbose:
         print_summary(notes)
@@ -119,7 +115,7 @@ def main(
         click.echo(f"      {len(notes)}音符 検出")
 
     if not notes:
-        click.echo("警告: 音符が検出されませんでした。出力は無音になります。")
+        click.echo("警告: 音符が検出されませんでした。--voiced-threshold を下げてみてください。")
 
     click.echo("[3/6] チャンネル振り分け中 ...")
     audio_for_ch4 = None if no_ch4 else samples
@@ -141,7 +137,6 @@ def main(
 
     click.echo(f"[6/6] 書き出し: {output_path}")
     export_wav(output, sr, output_path)
-
     click.echo("完了!")
 
 
