@@ -53,9 +53,11 @@ def transcribe(
     Returns:
         NoteEvent のリスト（開始時刻順）
     """
-    # TFの余分なログを抑制
+    # TFとbasic-pitchの余分なログを抑制
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
     warnings.filterwarnings("ignore")
+    import logging
+    logging.getLogger("root").setLevel(logging.ERROR)
 
     from basic_pitch.inference import predict, Model
     from basic_pitch import ICASSP_2022_MODEL_PATH
